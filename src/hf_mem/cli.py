@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from hf_mem.connectors import Connector, GCSConnector, HFConnector, LocalConnector, S3Connector
+from hf_mem.connectors import AzureConnector, Connector, GCSConnector, HFConnector, LocalConnector, S3Connector
 from hf_mem.connectors.hf import make_hf_headers
 from hf_mem.metadata import parse_safetensors_header_bytes, parse_safetensors_metadata
 from hf_mem.print import print_report
@@ -310,8 +310,8 @@ def main() -> None:
 
     parser.add_argument(
         "--connector",
-        choices=["hf", "local", "s3", "gcs"],
-        help="Source connector: hf (Hugging Face Hub), local (directory), s3 (AWS S3), gcs (Google Cloud Storage). Inferred from other args if omitted.",
+        choices=["hf", "local", "s3", "gcs", "azure"],
+        help="Source connector: hf (Hugging Face Hub), local (directory), s3 (AWS S3), gcs (GCS), azure (Azure Blob Storage). Inferred from other args if omitted.",
     )
     parser.add_argument(
         "--model-id",
@@ -346,6 +346,21 @@ def main() -> None:
         "--gcs-prefix",
         default="",
         help="Prefix (folder) inside the GCS bucket. Default: root.",
+    )
+    parser.add_argument(
+        "--azure-container",
+        metavar="CONTAINER",
+        help="Azure Blob Storage container name (connector=azure). Use with optional --azure-prefix and --azure-account.",
+    )
+    parser.add_argument(
+        "--azure-prefix",
+        default="",
+        help="Prefix (folder) inside the Azure container. Default: root.",
+    )
+    parser.add_argument(
+        "--azure-account",
+        default="",
+        help="Azure Storage account name (when not using AZURE_STORAGE_CONNECTION_STRING). Uses DefaultAzureCredential.",
     )
 
     parser.add_argument(
@@ -397,6 +412,8 @@ def main() -> None:
             connector_name = "s3"
         elif args.gcs_bucket:
             connector_name = "gcs"
+        elif args.azure_container:
+            connector_name = "azure"
         else:
             connector_name = "hf"
 
@@ -435,11 +452,20 @@ def main() -> None:
                 parser.error("--s3-bucket is required for connector 's3'")
             model_id = args.model_id or args.s3_bucket
             connector = S3Connector(args.s3_bucket, args.s3_prefix or "")
-        else:  # gcs
+        elif connector_name == "gcs":
             if not args.gcs_bucket:
                 parser.error("--gcs-bucket is required for connector 'gcs'")
             model_id = args.model_id or args.gcs_bucket
             connector = GCSConnector(args.gcs_bucket, args.gcs_prefix or "")
+        else:  # azure
+            if not args.azure_container:
+                parser.error("--azure-container is required for connector 'azure'")
+            model_id = args.model_id or args.azure_container
+            connector = AzureConnector(
+                args.azure_container,
+                args.azure_prefix or "",
+                account=args.azure_account or None,
+            )
 
         return await run_with_connector(
             connector,

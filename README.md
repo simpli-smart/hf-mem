@@ -5,7 +5,7 @@
 > [!WARNING]
 > `hf-mem` is still experimental and therefore subject to major changes across releases, so please keep in mind that breaking changes may occur until v1.0.0.
 
-`hf-mem` is a CLI to estimate inference memory requirements for Hugging Face–style models, written in Python. It reads [Safetensors](https://github.com/huggingface/safetensors) metadata from multiple sources: **Hugging Face Hub**, **local folder**, **AWS S3**, and **Google Cloud Storage (GCS)**. The core only depends on `httpx`; S3 and GCS use optional extras. It's recommended to run with [`uv`](https://github.com/astral-sh/uv) for a better experience.
+`hf-mem` is a CLI to estimate inference memory requirements for Hugging Face–style models, written in Python. It reads [Safetensors](https://github.com/huggingface/safetensors) metadata from multiple sources: **Hugging Face Hub**, **local folder**, **AWS S3**, **Google Cloud Storage (GCS)**, and **Azure Blob Storage**. The core only depends on `httpx`; S3, GCS, and Azure use optional extras. It's recommended to run with [`uv`](https://github.com/astral-sh/uv) for a better experience.
 
 `hf-mem` lets you estimate the inference requirements for any model layout that uses Safetensors—including [Transformers](https://github.com/huggingface/transformers), [Diffusers](https://github.com/huggingface/diffusers), and [Sentence Transformers](https://github.com/huggingface/sentence-transformers)—whether the files live on the Hub, on disk, or in object storage.
 
@@ -23,6 +23,9 @@ pip install hf-mem[s3]
 # With GCS support
 pip install hf-mem[gcs]
 
+# With Azure Blob Storage support
+pip install hf-mem[azure]
+
 # All connectors
 pip install hf-mem[all]
 ```
@@ -37,8 +40,9 @@ Or run without installing: `uvx hf-mem ...`
 | **local** | Local directory (e.g. downloaded model) | `--local-path` |
 | **s3** | AWS S3 bucket | `--s3-bucket` (optional: `--s3-prefix`) |
 | **gcs** | Google Cloud Storage bucket | `--gcs-bucket` (optional: `--gcs-prefix`) |
+| **azure** | Azure Blob Storage container | `--azure-container` (optional: `--azure-prefix`, `--azure-account`) |
 
-Use `--connector hf|local|s3|gcs` to set the source explicitly; otherwise it is inferred from `--local-path`, `--s3-bucket`, or `--gcs-bucket`.
+Use `--connector hf|local|s3|gcs|azure` to set the source explicitly; otherwise it is inferred from `--local-path`, `--s3-bucket`, `--gcs-bucket`, or `--azure-container`.
 
 ## Usage
 
@@ -96,6 +100,19 @@ pip install hf-mem[gcs]
 hf-mem --gcs-bucket my-bucket --gcs-prefix models/llama-2-7b
 # or explicitly
 hf-mem --connector gcs --gcs-bucket my-bucket --gcs-prefix models/llama-2-7b
+```
+
+### Azure Blob Storage
+
+Requires `hf-mem[azure]` (azure-storage-blob, azure-identity). Authenticate via `AZURE_STORAGE_CONNECTION_STRING`, or set `--azure-account` (and use DefaultAzureCredential: env, managed identity, Azure CLI, etc.).
+
+```bash
+pip install hf-mem[azure]
+# With connection string (env AZURE_STORAGE_CONNECTION_STRING)
+hf-mem --azure-container my-container --azure-prefix models/llama-2-7b
+
+# With account name + DefaultAzureCredential
+hf-mem --connector azure --azure-account mystorageaccount --azure-container my-container --azure-prefix models/llama-2-7b
 ```
 
 ## Experimental
