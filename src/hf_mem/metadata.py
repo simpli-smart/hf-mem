@@ -1,8 +1,20 @@
+import json
 import math
+import struct
 from dataclasses import dataclass
 from typing import Any, Dict
 
 from hf_mem.types import SafetensorsDtypes, get_safetensors_dtype_bytes
+
+
+def parse_safetensors_header_bytes(data: bytes) -> Dict[str, Any]:
+    """Parse safetensors header: first 8 bytes (little-endian uint64) = metadata size, then JSON."""
+    if len(data) < 8:
+        raise ValueError(f"Need at least 8 bytes for safetensors header, got {len(data)}")
+    metadata_size = struct.unpack("<Q", data[:8])[0]
+    if len(data) >= 8 + metadata_size:
+        return json.loads(data[8 : 8 + metadata_size])
+    raise ValueError(f"Not enough bytes: need 8+{metadata_size}, got {len(data)}")
 
 
 @dataclass
