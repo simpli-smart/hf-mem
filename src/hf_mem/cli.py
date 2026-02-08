@@ -22,6 +22,50 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
 MAX_CONCURRENCY = int(os.getenv("MAX_WORKERS", min(32, (os.cpu_count() or 1) + 4)))
 
 
+def get_local_file_list(folder: str) -> List[str]:
+    """Return list of relative paths under folder (files only), matching HF tree API shape."""
+    file_paths: List[str] = []
+    for root, _dirs, files in os.walk(folder, topdown=True):
+        rel_root = os.path.relpath(root, folder)
+        if rel_root == ".":
+            rel_root = ""
+        for name in files:
+            file_paths.append(os.path.join(rel_root, name).replace("\\", "/") if rel_root else name)
+    return file_paths
+
+
+def read_json_local(filepath: str) -> Any:
+    with open(filepath, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def read_safetensors_metadata_local(filepath: str) -> Dict[str, Any]:
+    with open(filepath, "rb") as f:
+        header = f.read(8)
+        metadata_size = struct.unpack("<Q", header)[0]
+        metadata_bytes = f.read(metadata_size)
+        return json.loads(metadata_bytes)
+
+
+def get_modules_and_dense_metadata_local(folder: str) -> Dict[str, Any]:
+    """Read Dense module safetensors metadata from a local folder (sentence-transformers layout)."""
+    dense_metadata: Dict[str, Any] = {}
+    modules_path = os.path.join(folder, "modules.json")
+    if not os.path.isfile(modules_path):
+        return dense_metadata
+    modules = read_json_local(modules_path)
+    paths = [
+        module.get("path")
+        for module in modules
+        if "type" in module and module.get("type") == "sentence_transformers.models.Dense" and "path" in module
+    ]
+    for path in paths:
+        model_path = os.path.join(folder, path, "model.safetensors")
+        if os.path.isfile(model_path):
+            dense_metadata[path] = read_safetensors_metadata_local(model_path)
+    return dense_metadata
+
+
 # NOTE: Return type-hint set to `Any`, but it will only be a JSON-compatible object
 async def get_json_file(client: httpx.AsyncClient, url: str, headers: Optional[Dict[str, str]] = None) -> Any:
     response = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -370,7 +414,7 @@ async def run(
             out["batch_size"] = batch_size
             out["cache_size"] = cache_size
             out["cache_dtype"] = cache_dtype  # type: ignore
-        print(json.dumps(out))
+        return out
     else:
         # TODO: Use a `KvCache` dataclass instead and make sure that the JSON output is aligned
         if experimental and cache_size:
@@ -395,10 +439,215 @@ async def run(
             )
 
 
+def run_local(
+    local_path: str,
+    model_id: str,
+    revision: str,
+    experimental: bool = False,
+    max_model_len: int | None = None,
+    batch_size: int = 1,
+    kv_cache_dtype: str | None = None,
+    json_output: bool = False,
+    ignore_table_width: bool = False,
+) -> Dict[str, Any] | None:
+    """Run memory report using safetensors from a local folder (e.g. downloaded from HF)."""
+    folder = os.path.abspath(os.path.expanduser(local_path))
+    if not os.path.isdir(folder):
+        raise RuntimeError(f"Local path is not a directory: {folder}")
+
+    file_paths = get_local_file_list(folder)
+
+    if "model.safetensors" in file_paths:
+        raw_metadata = read_safetensors_metadata_local(os.path.join(folder, "model.safetensors"))
+        if "config_sentence_transformers.json" in file_paths:
+            dense_metadata = get_modules_and_dense_metadata_local(folder)
+            raw_metadata = {"0_Transformer": raw_metadata, **dense_metadata}
+        else:
+            raw_metadata = {"Transformer": raw_metadata}
+        metadata = parse_safetensors_metadata(raw_metadata=raw_metadata)
+    elif "model.safetensors.index.json" in file_paths:
+        files_index = read_json_local(os.path.join(folder, "model.safetensors.index.json"))
+        shard_paths = set(files_index["weight_map"].values())
+        metadata_list = [read_safetensors_metadata_local(os.path.join(folder, f)) for f in shard_paths]
+        raw_metadata = reduce(lambda acc, m: acc | m, metadata_list, {})
+        if "config_sentence_transformers.json" in file_paths:
+            dense_metadata = get_modules_and_dense_metadata_local(folder)
+            raw_metadata = {"0_Transformer": raw_metadata, **dense_metadata}
+        else:
+            raw_metadata = {"Transformer": raw_metadata}
+        metadata = parse_safetensors_metadata(raw_metadata=raw_metadata)
+    elif "model_index.json" in file_paths:
+        files_index = read_json_local(os.path.join(folder, "model_index.json"))
+        paths = {k for k in files_index if not k.startswith("_")}
+        path_metadatas: Dict[str, List[Dict[str, Any]]] = {}
+        for path in paths:
+            if f"{path}/diffusion_pytorch_model.safetensors" in file_paths:
+                path_metadatas[path] = [
+                    read_safetensors_metadata_local(
+                        os.path.join(folder, path, "diffusion_pytorch_model.safetensors")
+                    )
+                ]
+            elif f"{path}/model.safetensors" in file_paths:
+                path_metadatas[path] = [
+                    read_safetensors_metadata_local(os.path.join(folder, path, "model.safetensors"))
+                ]
+            elif f"{path}/diffusion_pytorch_model.safetensors.index.json" in file_paths:
+                idx = read_json_local(
+                    os.path.join(folder, path, "diffusion_pytorch_model.safetensors.index.json")
+                )
+                path_metadatas[path] = [
+                    read_safetensors_metadata_local(os.path.join(folder, path, f))
+                    for f in set(idx["weight_map"].values())
+                ]
+            elif f"{path}/model.safetensors.index.json" in file_paths:
+                idx = read_json_local(os.path.join(folder, path, "model.safetensors.index.json"))
+                path_metadatas[path] = [
+                    read_safetensors_metadata_local(os.path.join(folder, path, f))
+                    for f in set(idx["weight_map"].values())
+                ]
+        raw_metadata = {
+            path: reduce(lambda acc, m: acc | m, meta_list, {})
+            for path, meta_list in path_metadatas.items()
+        }
+        metadata = parse_safetensors_metadata(raw_metadata=raw_metadata)
+    else:
+        raise RuntimeError(
+            "NONE OF `model.safetensors`, `model.safetensors.index.json`, `model_index.json` HAS BEEN FOUND in the local folder"
+        )
+
+    cache_size = None
+    cache_dtype = None
+    if experimental and "config.json" in file_paths:
+        config_path = os.path.join(folder, "config.json")
+        config: Dict[str, Any] = read_json_local(config_path)
+        if "architectures" not in config or (
+            "architectures" in config
+            and not any(
+                arch.__contains__("ForCausalLM") or arch.__contains__("ForConditionalGeneration")
+                for arch in config["architectures"]
+            )
+        ):
+            warnings.warn(
+                "`--experimental` was provided, but either `config.json` doesn't have the `architectures` key or the model is neither `...ForCausalLM` nor `...ForConditionalGeneration`; KV Cache estimation might not apply."
+            )
+        else:
+            if (
+                any(arch.__contains__("ForConditionalGeneration") for arch in config["architectures"])
+                and "text_config" in config
+            ):
+                config = config["text_config"]
+            if max_model_len is None:
+                max_model_len = config.get(
+                    "max_position_embeddings",
+                    config.get("n_positions", config.get("max_seq_len", max_model_len)),
+                )
+            if max_model_len is None:
+                warnings.warn(
+                    "`--max-model-len` was not set and could not be inferred from config; KV context length cannot be estimated."
+                )
+            if not all(k in config for k in {"hidden_size", "num_hidden_layers", "num_attention_heads"}):
+                warnings.warn(
+                    f"`config.json` doesn't contain all keys `hidden_size`, `num_hidden_layers`, `num_attention_heads`; found {list(config.keys())}."
+                )
+            if kv_cache_dtype in {"fp8_e5m2", "fp8_e4m3"}:
+                cache_dtype = kv_cache_dtype.upper().replace("FP8", "F8")
+            elif kv_cache_dtype in {"fp8", "fp8_ds_mla", "fp8_inc"}:
+                warnings.warn(
+                    f"`--kv-cache-dtype={kv_cache_dtype}` defaults to F8_E4M3 for calculations."
+                )
+                cache_dtype = "F8_E4M3"
+            elif kv_cache_dtype == "bfloat16":
+                cache_dtype = "BF16"
+            elif "quantization_config" in config and "quant_method" in config["quantization_config"]:
+                _quantization_config = config["quantization_config"]
+                _quant_method = _quantization_config["quant_method"]
+                if _quant_method != "fp8":
+                    raise RuntimeError(
+                        f"config.json has quant_method={_quant_method}; only fp8 is supported for auto KV cache dtype."
+                    )
+                _fmt = _quantization_config.get("fmt", _quantization_config.get("format", None))
+                if _fmt:
+                    if not _fmt.startswith("float8_"):
+                        _fmt = f"float8_{_fmt}"
+                    if _fmt not in TorchDtypes.__args__:
+                        raise RuntimeError(
+                            f"quantization_config fmt/format `{_fmt}` not supported; set --kv-cache-dtype=fp8 if needed."
+                        )
+                    cache_dtype = torch_dtype_to_safetensors_dtype(_fmt)
+                else:
+                    l = [
+                        d
+                        for c in metadata.components.values()
+                        for d in c.dtypes.keys()
+                        if d in {"F8_E5M2", "F8_E4M3"}
+                    ]
+                    cache_dtype = max(l, key=l.count, default=None) if l else None
+                    if not cache_dtype:
+                        raise RuntimeError(
+                            "quant_method=fp8 but no F8_E4M3/F8_E5M2 in weights; set --kv-cache-dtype=fp8 if needed."
+                        )
+            elif _cache_dtype := config.get("torch_dtype", None):
+                cache_dtype = torch_dtype_to_safetensors_dtype(_cache_dtype)
+            elif _cache_dtype := config.get("dtype", None):
+                cache_dtype = torch_dtype_to_safetensors_dtype(_cache_dtype)
+            else:
+                raise RuntimeError(
+                    "Set --kv-cache-dtype or ensure config.json has torch_dtype/dtype or quantization_config (fp8)."
+                )
+            cache_size = (
+                2
+                * config.get("num_hidden_layers")
+                * config.get("num_key_value_heads", config.get("num_attention_heads"))
+                * (config.get("hidden_size") // config.get("num_attention_heads"))
+                * max_model_len
+                * get_safetensors_dtype_bytes(cache_dtype)
+            )
+            if batch_size:
+                cache_size *= batch_size
+
+    if json_output:
+        out: Dict[str, Any] = {"model_id": model_id, "revision": revision, **asdict(metadata)}
+        if experimental and cache_size:
+            out["max_model_len"] = max_model_len
+            out["batch_size"] = batch_size
+            out["cache_size"] = cache_size
+            out["cache_dtype"] = cache_dtype
+        return out
+    if experimental and cache_size:
+        print_report(
+            model_id=model_id,
+            revision=revision,
+            metadata=metadata,
+            cache={
+                "max_model_len": max_model_len,
+                "cache_size": cache_size,
+                "batch_size": batch_size,
+                "cache_dtype": cache_dtype,
+            },
+            ignore_table_width=ignore_table_width,
+        )
+    else:
+        print_report(
+            model_id=model_id,
+            revision=revision,
+            metadata=metadata,
+            ignore_table_width=ignore_table_width,
+        )
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model-id", required=True, help="Model ID on the Hugging Face Hub")
+    parser.add_argument(
+        "--model-id",
+        help="Model ID on the Hugging Face Hub (or display name when using --local-path). Defaults to folder name when --local-path is set.",
+    )
+    parser.add_argument(
+        "--local-path",
+        metavar="DIR",
+        help="Path to a local folder containing safetensors (e.g. a model downloaded from Hugging Face). When set, model info is read from disk instead of the Hub.",
+    )
     parser.add_argument(
         "--revision",
         default="main",
@@ -445,22 +694,40 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.experimental:
-        warnings.warn(
-            "`--experimental` is set, which means that models with an architecture as `...ForCausalLM` and `...ForConditionalGeneration` will include estimations for the KV Cache as well. You can also provide the args `--max-model-len` and `--batch-size` as part of the estimation. Note that enabling `--experimental` means that the output will be different both when displayed and when dumped as JSON with `--json-output`, so bear that in mind."
-        )
-
-    asyncio.run(
-        run(
+    if args.local_path:
+        if not args.model_id:
+            args.model_id = os.path.basename(os.path.abspath(os.path.expanduser(args.local_path)))
+        if args.experimental:
+            warnings.warn(
+                "`--experimental` is set; KV Cache estimation will use config.json from the local folder if present."
+            )
+        run_local(
+            local_path=args.local_path,
             model_id=args.model_id,
             revision=args.revision,
-            # NOTE: Below are the arguments that affect the KV cache estimation
             experimental=args.experimental,
             max_model_len=args.max_model_len,
             batch_size=args.batch_size,
             kv_cache_dtype=args.kv_cache_dtype,
-            # NOTE: Below are the arguments that affect the output format
             json_output=args.json_output,
             ignore_table_width=args.ignore_table_width,
         )
-    )
+    else:
+        if not args.model_id:
+            parser.error("--model-id is required when not using --local-path")
+        if args.experimental:
+            warnings.warn(
+                "`--experimental` is set, which means that models with an architecture as `...ForCausalLM` and `...ForConditionalGeneration` will include estimations for the KV Cache as well. You can also provide the args `--max-model-len` and `--batch-size` as part of the estimation. Note that enabling `--experimental` means that the output will be different both when displayed and when dumped as JSON with `--json-output`, so bear that in mind."
+            )
+        asyncio.run(
+            run(
+                model_id=args.model_id,
+                revision=args.revision,
+                experimental=args.experimental,
+                max_model_len=args.max_model_len,
+                batch_size=args.batch_size,
+                kv_cache_dtype=args.kv_cache_dtype,
+                json_output=args.json_output,
+                ignore_table_width=args.ignore_table_width,
+            )
+        )
