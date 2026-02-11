@@ -13,6 +13,12 @@ dependencies = [
     "httpx[http2]>=0.28.1",
 ]
 
+[project.optional-dependencies]
+s3 = ["boto3>=1.28.0"]
+gcs = ["google-cloud-storage>=2.0.0"]
+azure = ["azure-storage-blob>=12.19.0", "azure-identity>=1.15.0"]
+all = ["boto3>=1.28.0", "google-cloud-storage>=2.0.0", "azure-storage-blob>=12.19.0", "azure-identity>=1.15.0"]
+
 [project.urls]
 Homepage = "https://github.com/alvarobartt/hf-mem"
 Repository = "https://github.com/alvarobartt/hf-mem"

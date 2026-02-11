@@ -5,15 +5,48 @@
 > [!WARNING]
 > `hf-mem` is still experimental and therefore subject to major changes across releases, so please keep in mind that breaking changes may occur until v1.0.0.
 
-`hf-mem` is a CLI to estimate inference memory requirements for Hugging Face models, written in Python. `hf-mem` is lightweight, only depends on `httpx`, as it pulls the [Safetensors](https://github.com/huggingface/safetensors) metadata via [HTTP Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests). It's recommended to run with [`uv`](https://github.com/astral-sh/uv) for a better experience.
+`hf-mem` is a CLI to estimate inference memory requirements for Hugging Face–style models, written in Python. It reads [Safetensors](https://github.com/huggingface/safetensors) metadata from multiple sources: **Hugging Face Hub**, **local folder**, **AWS S3**, **Google Cloud Storage (GCS)**, and **Azure Blob Storage**. The core only depends on `httpx`; S3, GCS, and Azure use optional extras. It's recommended to run with [`uv`](https://github.com/astral-sh/uv) for a better experience.
 
-`hf-mem` lets you estimate the inference requirements to run any model from the Hugging Face Hub, including [Transformers](https://github.com/huggingface/transformers), [Diffusers](https://github.com/huggingface/diffusers) and [Sentence Transformers](https://github.com/huggingface/sentence-transformers) models, as well as any model that contains [Safetensors](https://github.com/huggingface/safetensors) compatible weights.
+`hf-mem` lets you estimate the inference requirements for any model layout that uses Safetensors—including [Transformers](https://github.com/huggingface/transformers), [Diffusers](https://github.com/huggingface/diffusers), and [Sentence Transformers](https://github.com/huggingface/sentence-transformers)—whether the files live on the Hub, on disk, or in object storage.
 
 Read more information about `hf-mem` in [this short-form post](https://alvarobartt.com/hf-mem).
 
+## Installation
+
+```bash
+# Core (HF Hub + local)
+pip install hf-mem
+
+# With S3 support
+pip install hf-mem[s3]
+
+# With GCS support
+pip install hf-mem[gcs]
+
+# With Azure Blob Storage support
+pip install hf-mem[azure]
+
+# All connectors
+pip install hf-mem[all]
+```
+
+Or run without installing: `uvx hf-mem ...`
+
+## Sources (connectors)
+
+| Connector | Description | Required args |
+|-----------|-------------|---------------|
+| **hf** | Hugging Face Hub (default) | `--model-id` |
+| **local** | Local directory (e.g. downloaded model) | `--local-path` |
+| **s3** | AWS S3 bucket | `--s3-bucket` (optional: `--s3-prefix`) |
+| **gcs** | Google Cloud Storage bucket | `--gcs-bucket` (optional: `--gcs-prefix`) |
+| **azure** | Azure Blob Storage container | `--azure-container` (optional: `--azure-prefix`, `--azure-account`) |
+
+Use `--connector hf|local|s3|gcs|azure` to set the source explicitly; otherwise it is inferred from `--local-path`, `--s3-bucket`, `--gcs-bucket`, or `--azure-container`.
+
 ## Usage
 
-### Transformers
+### Hugging Face Hub (Transformers)
 
 ```bash
 uvx hf-mem --model-id MiniMaxAI/MiniMax-M2
@@ -37,9 +70,54 @@ uvx hf-mem --model-id google/embeddinggemma-300m
 
 <img src="https://github.com/user-attachments/assets/a52c464b-a6c1-446d-9921-68aaefb9df88" />
 
+### Local folder
+
+Use a directory that contains the same layout as a Hub repo (e.g. a model downloaded with `huggingface-cli download` or `git clone`):
+
+```bash
+hf-mem --local-path /path/to/model
+# or explicitly
+hf-mem --connector local --local-path ./my-model --model-id my-model
+```
+
+### S3
+
+Requires `hf-mem[s3]` (boto3). Uses the default AWS credentials (env, `~/.aws/credentials`, or IAM role).
+
+```bash
+pip install hf-mem[s3]
+hf-mem --s3-bucket my-bucket --s3-prefix models/llama-2-7b
+# or explicitly
+hf-mem --connector s3 --s3-bucket my-bucket --s3-prefix models/llama-2-7b --model-id llama-2-7b
+```
+
+### GCS
+
+Requires `hf-mem[gcs]` (google-cloud-storage). Uses default GCP credentials (e.g. `GOOGLE_APPLICATION_CREDENTIALS` or gcloud).
+
+```bash
+pip install hf-mem[gcs]
+hf-mem --gcs-bucket my-bucket --gcs-prefix models/llama-2-7b
+# or explicitly
+hf-mem --connector gcs --gcs-bucket my-bucket --gcs-prefix models/llama-2-7b
+```
+
+### Azure Blob Storage
+
+Requires `hf-mem[azure]` (azure-storage-blob, azure-identity). Authenticate via `AZURE_STORAGE_CONNECTION_STRING`, or set `--azure-account` (and use DefaultAzureCredential: env, managed identity, Azure CLI, etc.).
+
+```bash
+pip install hf-mem[azure]
+# With connection string (env AZURE_STORAGE_CONNECTION_STRING)
+hf-mem --azure-container my-container --azure-prefix models/llama-2-7b
+
+# With account name + DefaultAzureCredential
+hf-mem --connector azure --azure-account mystorageaccount --azure-container my-container --azure-prefix models/llama-2-7b
+```
+
 ## Experimental
 
-By enabling the `--experimental` flag, you can enable the KV Cache memory estimation for LLMs (`...ForCausalLM`) and VLMs (`...ForConditionalGeneration`), even including a custom `--max-model-len` (defaults to the `config.json` default), `--batch-size` (defaults to 1), and the `--kv-cache-dtype` (defaults to `auto` which means it uses the default data type set in `config.json` under `torch_dtype` or `dtype`, or rather from `quantization_config` when applicable).
+By enabling the `--experimental` flag, you can enable the KV Cache memory estimation for LLMs (`...ForCausalLM`) and VLMs (`...ForConditionalGeneration`), with optional `--max-model-len` (from `config.json` if unset), `--batch-size` (default 1), and `--kv-cache-dtype` (default `auto`, from `config.json` when available). When using local, S3, or GCS, `config.json` is read from that same source.
 
 ```bash
 uvx hf-mem --model-id MiniMaxAI/MiniMax-M2 --experimental
