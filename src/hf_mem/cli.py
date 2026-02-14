@@ -14,59 +14,56 @@ from hf_mem.connectors import AzureConnector, Connector, GCSConnector, HFConnect
 from hf_mem.connectors.hf import make_hf_headers
 from hf_mem.metadata import parse_safetensors_header_bytes, parse_safetensors_metadata
 from hf_mem.print import print_report
-from hf_mem.types import TorchDtypes, get_safetensors_dtype_bytes, torch_dtype_to_safetensors_dtype
-from transformers import CompressedTensorsConfig, AwqConfig, GPTQConfig, BitsAndBytesConfig
+
 
 def resolve_quantization_config(
     quantization_config: Optional[dict] = None,
 ) -> Optional[str]:
+    """Resolve quantization config dict to a short dtype string (e.g. int4, fp8). No transformers dependency."""
     if quantization_config is None:
         return None
 
     if "quant_method" in quantization_config:
         quant_method = quantization_config["quant_method"]
         if quant_method == "compressed-tensors":
-            config = CompressedTensorsConfig(**quantization_config).to_dict()
             weights = (
-                config.get("config_groups", {}).get("group_0", {}).get("weights", None)
+                quantization_config.get("config_groups", {})
+                .get("group_0", {})
+                .get("weights", None)
             )
             if weights is not None:
-                return weights["type"] + str(weights["num_bits"])
-            else:
-                return "float16"
+                return weights.get("type", "int") + str(weights.get("num_bits", 4))
+            return "float16"
 
-        elif quant_method == "awq":
-            config = AwqConfig(**quantization_config).to_dict()
-            return "int" + str(config["bits"])
-        elif quant_method == "gptq":
-            config = GPTQConfig(**quantization_config).to_dict()
-            return "int" + str(config["bits"])
+        if quant_method == "awq":
+            bits = quantization_config.get("bits", 4)
+            return "int" + str(bits)
+        if quant_method == "gptq":
+            bits = quantization_config.get("bits", 4)
+            return "int" + str(bits)
 
-        elif quant_method == "fp8":
+        if quant_method == "fp8":
             return "fp8"
 
-        elif quant_method == "bitsandbytes":
-            config = BitsAndBytesConfig(**quantization_config).to_dict()
-            if config.get("load_in_8bit", False):
+        if quant_method == "bitsandbytes":
+            if quantization_config.get("load_in_8bit", False):
                 return "int8"
-            elif config.get("load_in_4bit", False):
+            if quantization_config.get("load_in_4bit", False):
                 return "int4"
-            else:
-                raise ValueError(
-                    f"No weights found in BitsAndBytes quantization config: {quantization_config}"
-                )
-        elif quant_method == "mxfp4":
+            raise ValueError(
+                f"No weights found in BitsAndBytes quantization config: {quantization_config}"
+            )
+        if quant_method == "mxfp4":
             return "mxfp4"
-        
-    elif "quantization" in quantization_config:
+
+    if "quantization" in quantization_config:
         print("Model is quantized with TensorRT Model Optimizer")
         quant_algo = quantization_config["quantization"]["quant_algo"]
         if quant_algo == "FP8":
             return "fp8"
-        elif quant_algo == "NVFP4":
+        if quant_algo == "NVFP4":
             return "nvfp4"
-        else:
-            raise ValueError(f"Invalid quantization algorithm: {quant_algo}")
+        raise ValueError(f"Invalid quantization algorithm: {quant_algo}")
     return None
 
 def get_tp_constraints(
