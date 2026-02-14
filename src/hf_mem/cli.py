@@ -109,8 +109,11 @@ async def run_with_connector(
     kv_cache_dtype: str | None = None,
     json_output: bool = False,
     ignore_table_width: bool = False,
+    tp_limits: bool = False,
 ) -> Dict[str, Any] | None:
-    """Unified run: list files and read safetensors/config via the given connector."""
+    """Unified run: list files and read safetensors/config via the given connector.
+    If tp_limits=True, TP constraints are included in the returned dict (with or without json_output).
+    """
     file_paths = await connector.list_files()
 
     if "model.safetensors" in file_paths:
@@ -288,10 +291,13 @@ async def run_with_connector(
             out["batch_size"] = batch_size
             out["cache_size"] = cache_size
             out["cache_dtype"] = cache_dtype  # type: ignore
-        if "config.json" in file_paths:
+        if "config.json" in file_paths and tp_limits:
             config = await connector.read_file_json("config.json")
             out["tp_constraints"] = get_tp_constraints(config, model_id)
         return out
+    if tp_limits and "config.json" in file_paths:
+        config = await connector.read_file_json("config.json")
+        return {"tp_constraints": get_tp_constraints(config, model_id)}
     if experimental and cache_size:
         print_report(
             model_id=model_id,
@@ -324,6 +330,7 @@ async def run(
     kv_cache_dtype: str | None = None,
     json_output: bool = False,
     ignore_table_width: bool = False,
+    tp_limits: bool = False,
 ) -> Dict[str, Any] | None:
     """Run against Hugging Face Hub using HFConnector."""
     client = httpx.AsyncClient(
@@ -348,6 +355,7 @@ async def run(
             kv_cache_dtype=kv_cache_dtype,
             json_output=json_output,
             ignore_table_width=ignore_table_width,
+            tp_limits=tp_limits,
         )
     finally:
         await connector.close()
@@ -509,6 +517,7 @@ def main() -> None:
                     kv_cache_dtype=args.kv_cache_dtype,
                     json_output=args.json_output,
                     ignore_table_width=args.ignore_table_width,
+                    tp_limits=args.tp_limits or args.json_output,
                 )
         elif connector_name == "local":
             if not args.local_path:
@@ -558,6 +567,7 @@ def main() -> None:
             kv_cache_dtype=args.kv_cache_dtype,
             json_output=args.json_output,
             ignore_table_width=args.ignore_table_width,
+            tp_limits=args.tp_limits or args.json_output,
         )
 
     output = asyncio.run(_run())
