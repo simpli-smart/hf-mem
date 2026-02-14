@@ -106,7 +106,7 @@ async def run_with_connector(
     experimental: bool = False,
     max_model_len: int | None = None,
     batch_size: int = 1,
-    kv_cache_dtype: str | None = None,
+    dtype_bytes: int = 2,
     json_output: bool = False,
     ignore_table_width: bool = False,
     tp_limits: bool = False,
@@ -216,69 +216,13 @@ async def run_with_connector(
                     f"`config.json` doesn't contain all the keys `hidden_size`, `num_hidden_layers`, and `num_attention_heads`, but only {config.keys()}."  # type: ignore
                 )
 
-            if kv_cache_dtype in {"fp8_e5m2", "fp8_e4m3"}:
-                cache_dtype = kv_cache_dtype.upper().replace("FP8", "F8")
-            elif kv_cache_dtype in {"fp8", "fp8_ds_mla", "fp8_inc"}:
-                warnings.warn(
-                    f"--kv-cache-dtype={kv_cache_dtype}` has been provided, but given that none of those matches an actual Safetensors dtype since it should be any of `F8_E5M2` or `F8_E4M3`, the `--kv-cache-dtype` will default to `F8_E4M3` instead, which implies that the calculations are the same given that both dtypes take 1 byte despite the quantization scheme of it, or the hardware compatibility; so the estimations should be accurate enough."
-                )
-                cache_dtype = "F8_E4M3"
-            elif kv_cache_dtype == "bfloat16":
-                cache_dtype = "BF16"
-            elif "quantization_config" in config and "quant_method" in config["quantization_config"]:
-                _quantization_config = config["quantization_config"]
-                _quant_method = _quantization_config["quant_method"]
-
-                if _quant_method != "fp8":
-                    raise RuntimeError(
-                        f"Provided `--kv-cache-dtype=auto` (or unset) and given that `config.json` contains the following `quantization_config={_quantization_config}` with a `quant_method` different than `fp8` i.e., `{_quant_method}`, which is not supported; you should enforce the `--kv-cache-dtype` value to whatever quantization precision it's using, if applicable.\nAs KV cache estimation is still experimental, as that might not be the case for your model, then feel free to open an issue at https://github.com/alvarobartt/hf-mem with a report and eventually what solution you would like to see implemented."
-                    )
-
-                _fmt = _quantization_config.get("fmt", _quantization_config.get("format", None))
-                if _fmt:
-                    if not _fmt.startswith("float8_"):
-                        _fmt = f"float8_{_fmt}"
-
-                    if _fmt not in TorchDtypes.__args__:
-                        raise RuntimeError(
-                            f"Provided `--kv-cache-dtype=auto` (or unset) and given that `config.json` contains the following `quantization_config={_quantization_config}` with a `fmt` (or `format`) value of `{_fmt}` that's not supported (should be any of {TorchDtypes.__args__}), you might need to set `--kv-cache-dtype=fp8` to enforce the dtype instead of pulling it from the `config.json`.\nAs KV cache estimation is still experimental, as that might not be the case for your model, then feel free to open an issue at https://github.com/alvarobartt/hf-mem with a report and eventually what solution you would like to see implemented."
-                        )
-
-                    cache_dtype = torch_dtype_to_safetensors_dtype(_fmt)
-                else:
-                    cache_dtype = max(
-                        (
-                            l := [
-                                d
-                                for c in metadata.components.values()
-                                for d in c.dtypes.keys()
-                                if d in {"F8_E5M2", "F8_E4M3"}
-                            ]
-                        ),
-                        key=l.count,
-                        default=None,
-                    )
-
-                    if not cache_dtype:
-                        raise RuntimeError(
-                            f"The `config.json` file for `--model-id={model_id}` contains `quantization_config={_quantization_config}` but the `quant_method=fp8` whereas any tensor in the model weights is set to any of `F8_E4M3` nor `F8_E5M2`, which means that the `F8_` format for the Safetensors dtype cannot be inferred; so you might need to set `--kv-cache-dtype=fp8` to enforce the dtype instead of pulling it from the `config.json`.\nAs KV cache estimation is still experimental, as that might not be the case for your model, then feel free to open an issue at https://github.com/alvarobartt/hf-mem with a report and eventually what solution you would like to see implemented."
-                        )
-            elif _cache_dtype := config.get("torch_dtype", None):
-                cache_dtype = torch_dtype_to_safetensors_dtype(_cache_dtype)
-            elif _cache_dtype := config.get("dtype", None):
-                cache_dtype = torch_dtype_to_safetensors_dtype(_cache_dtype)
-            else:
-                raise RuntimeError(
-                    f"Provided `--kv-cache-dtype={kv_cache_dtype}` but it needs to be any of `auto`, `bfloat16`, `fp8`, `fp8_ds_mla`, `fp8_e4m3`, `fp8_e5m2` or `fp8_inc`. If `--kv-cache-dtype=auto` (or unset), then the `config.json` should either contain the `torch_dtype` or `dtype` fields set; or if quantized, then `quantization_config` needs to be set and contain the key `quant_method` with value `fp8` (as none of `fp32`, `fp16` or `bf16` is considered within the `quantization_config`), and optionally also contain `fmt` set to any valid FP8 format as `float8_e4m3` or `float8_e4m3fn`."
-                )
-
             cache_size = (
                 2
                 * config.get("num_hidden_layers")  # type: ignore
                 * config.get("num_key_value_heads", config.get("num_attention_heads"))  # type: ignore
                 * (config.get("hidden_size") // config.get("num_attention_heads"))  # type: ignore
                 * max_model_len
-                * get_safetensors_dtype_bytes(cache_dtype)
+                * dtype_bytes
             )
 
             if batch_size:
@@ -290,14 +234,16 @@ async def run_with_connector(
             out["max_model_len"] = max_model_len
             out["batch_size"] = batch_size
             out["cache_size"] = cache_size
-            out["cache_dtype"] = cache_dtype  # type: ignore
+        
         if "config.json" in file_paths and tp_limits:
             config = await connector.read_file_json("config.json")
             out["tp_constraints"] = get_tp_constraints(config, model_id)
+            out["architecture"] = config.get("architectures")[0]
+        
+        if "model_index.json" in file_paths:
+            model_index = await connector.read_file_json("model_index.json")
+            out["architecture"] = model_index.get("_class_name")
         return out
-    if tp_limits and "config.json" in file_paths:
-        config = await connector.read_file_json("config.json")
-        return {"tp_constraints": get_tp_constraints(config, model_id)}
     if experimental and cache_size:
         print_report(
             model_id=model_id,
@@ -327,7 +273,7 @@ async def run(
     experimental: bool = False,
     max_model_len: int | None = None,
     batch_size: int = 1,
-    kv_cache_dtype: str | None = None,
+    dtype_bytes: int = 2,
     json_output: bool = False,
     ignore_table_width: bool = False,
     tp_limits: bool = False,
@@ -352,7 +298,7 @@ async def run(
             experimental=experimental,
             max_model_len=max_model_len,
             batch_size=batch_size,
-            kv_cache_dtype=kv_cache_dtype,
+            dtype_bytes=dtype_bytes,
             json_output=json_output,
             ignore_table_width=ignore_table_width,
             tp_limits=tp_limits,
@@ -439,15 +385,13 @@ def main() -> None:
         default=1,
         help="Batch size to help estimate the required RAM for caching when running the inference. Defaults to 1.",
     )
-    parser.add_argument(
-        "--kv-cache-dtype",
-        type=str,
-        default="auto",
-        # NOTE: https://docs.vllm.ai/en/stable/cli/serve/#-kv-cache-dtype
-        choices={"auto", "bfloat16", "fp8", "fp8_ds_mla", "fp8_e4m3", "fp8_e5m2", "fp8_inc"},
-        help="Data type for the KV cache storage. If `auto` is specified, it will use the default model dtype specified in the `config.json` (if available). Despite the FP8 data types having different formats, all those take 1 byte, meaning that the calculation would lead to the same results. Defaults to `auto`.",
-    )
 
+    parser.add_argument(
+        "--dtype-bytes",
+        type=int,
+        default=2,
+        help="Bytes per dtype. Defaults to 2.",
+    )
     parser.add_argument(
         "--json-output",
         action="store_true",
@@ -514,7 +458,7 @@ def main() -> None:
                     experimental=args.experimental,
                     max_model_len=args.max_model_len,
                     batch_size=args.batch_size,
-                    kv_cache_dtype=args.kv_cache_dtype,
+                    dtype_bytes=args.dtype_bytes,
                     json_output=args.json_output,
                     ignore_table_width=args.ignore_table_width,
                     tp_limits=args.tp_limits or args.json_output,
@@ -564,7 +508,6 @@ def main() -> None:
             experimental=args.experimental,
             max_model_len=args.max_model_len,
             batch_size=args.batch_size,
-            kv_cache_dtype=args.kv_cache_dtype,
             json_output=args.json_output,
             ignore_table_width=args.ignore_table_width,
             tp_limits=args.tp_limits or args.json_output,
