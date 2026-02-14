@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 import struct
 import warnings
@@ -14,6 +15,52 @@ from hf_mem.connectors.hf import make_hf_headers
 from hf_mem.metadata import parse_safetensors_header_bytes, parse_safetensors_metadata
 from hf_mem.print import print_report
 from hf_mem.types import TorchDtypes, get_safetensors_dtype_bytes, torch_dtype_to_safetensors_dtype
+
+
+def get_tp_constraints(
+    config_input: str | Dict[str, Any], model_id: str = "Unknown"
+) -> Dict[str, Any]:
+    """
+    Compute TP limits from a model config (path or dict).
+    Uses num_attention_heads / num_key_value_heads only.
+    For encoder-decoder (ForConditionalGeneration), uses text_config.
+    """
+    if isinstance(config_input, str):
+        with open(config_input) as f:
+            config = json.load(f)
+    else:
+        config = config_input
+
+    # text_config edge case: encoder-decoder models
+    if (
+        "text_config" in config
+        and "architectures" in config
+        and any("ForConditionalGeneration" in a for a in config["architectures"])
+    ):
+        effective = config["text_config"]
+    else:
+        effective = config
+
+    q_heads = effective.get("num_attention_heads")
+    kv_heads = effective.get("num_key_value_heads", q_heads)
+
+    if q_heads is None:
+        return {"error": "Could not find attention head configuration. Ensure config is valid."}
+
+    max_tp = kv_heads
+    valid_degrees = [
+        i for i in range(1, max_tp + 1) if q_heads % i == 0 and kv_heads % i == 0
+    ]
+
+    return {
+        "model": config.get("_name_or_path", model_id),
+        "query_heads": q_heads,
+        "kv_heads": kv_heads,
+        "max_tp": max_tp,
+        "valid_degrees": valid_degrees,
+        "recommended_for_single_node": [d for d in valid_degrees if d <= 8],
+    }
+
 
 # NOTE: Defines the bytes that will be fetched per safetensors file, but the metadata
 # can indeed be larger than that
@@ -241,6 +288,9 @@ async def run_with_connector(
             out["batch_size"] = batch_size
             out["cache_size"] = cache_size
             out["cache_dtype"] = cache_dtype  # type: ignore
+        if "config.json" in file_paths:
+            config = await connector.read_file_json("config.json")
+            out["tp_constraints"] = get_tp_constraints(config, model_id)
         return out
     if experimental and cache_size:
         print_report(
@@ -400,6 +450,11 @@ def main() -> None:
         action="store_true",
         help="Whether to ignore the maximum recommended table width, in case the `--model-id` and/or `--revision` cause a row overflow when printing those.",
     )
+    parser.add_argument(
+        "--tp-limits",
+        action="store_true",
+        help="Print tensor parallel limits (max TP and valid degrees) from the model config and exit. Uses the same connector as the main command (--model-id, --local-path, etc.).",
+    )
 
     args = parser.parse_args()
 
@@ -423,25 +478,39 @@ def main() -> None:
         )
 
     async def _run() -> Dict[str, Any] | None:
-        connector: Connector
-        model_id: str
+        connector: Connector | None = None
+        model_id: str = ""
         revision: str = args.revision
 
         if connector_name == "hf":
             if not args.model_id:
                 parser.error("--model-id is required for connector 'hf'")
             model_id = args.model_id
-            return await run(
-                model_id=model_id,
-                revision=revision,
-                experimental=args.experimental,
-                max_model_len=args.max_model_len,
-                batch_size=args.batch_size,
-                kv_cache_dtype=args.kv_cache_dtype,
-                json_output=args.json_output,
-                ignore_table_width=args.ignore_table_width,
-            )
-        if connector_name == "local":
+            if args.tp_limits:
+                client = httpx.AsyncClient(
+                    limits=httpx.Limits(
+                        max_keepalive_connections=MAX_CONCURRENCY,
+                        max_connections=MAX_CONCURRENCY,
+                    ),
+                    timeout=httpx.Timeout(REQUEST_TIMEOUT),
+                    http2=True,
+                    follow_redirects=True,
+                )
+                connector = HFConnector(
+                    model_id, revision, client=client, headers=make_hf_headers(model_id, revision)
+                )
+            else:
+                return await run(
+                    model_id=model_id,
+                    revision=revision,
+                    experimental=args.experimental,
+                    max_model_len=args.max_model_len,
+                    batch_size=args.batch_size,
+                    kv_cache_dtype=args.kv_cache_dtype,
+                    json_output=args.json_output,
+                    ignore_table_width=args.ignore_table_width,
+                )
+        elif connector_name == "local":
             if not args.local_path:
                 parser.error("--local-path is required for connector 'local'")
             path = os.path.abspath(os.path.expanduser(args.local_path))
@@ -467,6 +536,18 @@ def main() -> None:
                 account=args.azure_account or None,
             )
 
+        if args.tp_limits and connector is not None and not args.json_output:
+            config = await connector.read_file_json("config.json")
+            result = get_tp_constraints(config, model_id)
+            if "error" in result:
+                print(result["error"])
+                if hasattr(connector, "close"):
+                    await connector.close()
+                return None
+            if hasattr(connector, "close"):
+                await connector.close()
+            return None
+
         return await run_with_connector(
             connector,
             model_id=model_id,
@@ -479,4 +560,6 @@ def main() -> None:
             ignore_table_width=args.ignore_table_width,
         )
 
-    asyncio.run(_run())
+    output = asyncio.run(_run())
+    if output is not None:
+        print(json.dumps(output, indent=2))
