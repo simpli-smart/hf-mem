@@ -15,7 +15,59 @@ from hf_mem.connectors.hf import make_hf_headers
 from hf_mem.metadata import parse_safetensors_header_bytes, parse_safetensors_metadata
 from hf_mem.print import print_report
 from hf_mem.types import TorchDtypes, get_safetensors_dtype_bytes, torch_dtype_to_safetensors_dtype
+from transformers import CompressedTensorsConfig, AwqConfig, GPTQConfig, BitsAndBytesConfig
 
+def resolve_quantization_config(
+    quantization_config: Optional[dict] = None,
+) -> Optional[str]:
+    if quantization_config is None:
+        return None
+
+    if "quant_method" in quantization_config:
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "compressed-tensors":
+            config = CompressedTensorsConfig(**quantization_config).to_dict()
+            weights = (
+                config.get("config_groups", {}).get("group_0", {}).get("weights", None)
+            )
+            if weights is not None:
+                return weights["type"] + str(weights["num_bits"])
+            else:
+                return "float16"
+
+        elif quant_method == "awq":
+            config = AwqConfig(**quantization_config).to_dict()
+            return "int" + str(config["bits"])
+        elif quant_method == "gptq":
+            config = GPTQConfig(**quantization_config).to_dict()
+            return "int" + str(config["bits"])
+
+        elif quant_method == "fp8":
+            return "fp8"
+
+        elif quant_method == "bitsandbytes":
+            config = BitsAndBytesConfig(**quantization_config).to_dict()
+            if config.get("load_in_8bit", False):
+                return "int8"
+            elif config.get("load_in_4bit", False):
+                return "int4"
+            else:
+                raise ValueError(
+                    f"No weights found in BitsAndBytes quantization config: {quantization_config}"
+                )
+        elif quant_method == "mxfp4":
+            return "mxfp4"
+        
+    elif "quantization" in quantization_config:
+        print("Model is quantized with TensorRT Model Optimizer")
+        quant_algo = quantization_config["quantization"]["quant_algo"]
+        if quant_algo == "FP8":
+            return "fp8"
+        elif quant_algo == "NVFP4":
+            return "nvfp4"
+        else:
+            raise ValueError(f"Invalid quantization algorithm: {quant_algo}")
+    return None
 
 def get_tp_constraints(
     config_input: str | Dict[str, Any], model_id: str = "Unknown"
@@ -178,8 +230,12 @@ async def run_with_connector(
 
     cache_size = None
     cache_dtype = None
+    quantization = None
     if experimental and "config.json" in file_paths:
         config: Dict[str, Any] = await connector.read_file_json("config.json")
+        if "quantization_config" in config:
+            quantization = resolve_quantization_config(config["quantization_config"])
+        
         if "architectures" not in config or (
             "architectures" in config
             and not any(
@@ -228,8 +284,14 @@ async def run_with_connector(
             if batch_size:
                 cache_size *= batch_size
 
+    if "hf_quant_config.json" in file_paths:
+        hf_quant_config = await connector.read_file_json("hf_quant_config.json")
+        quantization = resolve_quantization_config(hf_quant_config)
+
     if json_output:
         out = {"model_id": model_id, "revision": revision, **asdict(metadata)}
+        if quantization:
+            out["quantization"] = quantization
         if experimental and cache_size:
             out["max_model_len"] = max_model_len
             out["batch_size"] = batch_size
