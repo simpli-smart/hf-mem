@@ -21,7 +21,7 @@ def resolve_quantization_config(
 ) -> Optional[str]:
     """Resolve quantization config dict to a short dtype string (e.g. int4, fp8). No transformers dependency."""
     if quantization_config is None:
-        return None
+        return "float16"
 
     if "quant_method" in quantization_config:
         quant_method = quantization_config["quant_method"]
@@ -80,13 +80,10 @@ def get_tp_constraints(
     else:
         config = config_input
 
-    # text_config edge case: encoder-decoder models
-    if (
-        "text_config" in config
-        and "architectures" in config
-        and any("ForConditionalGeneration" in a for a in config["architectures"])
-    ):
+    if "text_config" in config:
         effective = config["text_config"]
+    elif "llm_config" in config:
+        effective = config["llm_config"]
     else:
         effective = config
 
@@ -230,28 +227,18 @@ async def run_with_connector(
     quantization = None
     if experimental and "config.json" in file_paths:
         config: Dict[str, Any] = await connector.read_file_json("config.json")
-        if "quantization_config" in config:
-            quantization = resolve_quantization_config(config["quantization_config"])
+        quantization = resolve_quantization_config(config.get("quantization_config"))
         
-        if "architectures" not in config or (
-            "architectures" in config
-            and not any(
-                arch.__contains__("ForCausalLM") or arch.__contains__("ForConditionalGeneration")
-                for arch in config["architectures"]
-            )
-        ):
+        if "architectures" not in config:
             warnings.warn(
-                "`--experimental` was provided, but either `config.json` doesn't have the `architectures` key meaning that the model architecture cannot be inferred, or rather that it's neither `...ForCausalLM` not `...ForConditionalGeneration`, meaning that the KV Cache estimation might not apply. If that's the case, then remove the `--experimental` flag from the command to suppress this warning."
+                "`--experimental` was provided, but `config.json` doesn't have the `architectures` key meaning that the model architecture cannot be inferred. If that's the case, then remove the `--experimental` flag from the command to suppress this warning."
             )
         else:
-            if (
-                any(arch.__contains__("ForConditionalGeneration") for arch in config["architectures"])
-                and "text_config" in config
-            ):
-                warnings.warn(
-                    f"Given that `--model-id={model_id}` is a `...ForConditionalGeneration` model, then the configuration from `config.json` will be retrieved from the key `text_config` instead."
-                )
+            if  "text_config" in config:
                 config = config["text_config"]
+            
+            elif "llm_config" in config:
+                config = config["llm_config"]
 
             if max_model_len is None:
                 max_model_len = config.get(
@@ -263,20 +250,26 @@ async def run_with_connector(
                 warnings.warn(
                     f"Either the `--max-model-len` was not set, is not available in `config.json` with the any of the keys: `max_position_embeddings`, `n_positions`, or `max_seq_len` (in that order of priority), or both; so the memory required to fit the context length cannot be estimated."
                 )
+                max_model_len = 131072
+                print(f"Using default max model length of 131072")
 
             if not all(k in config for k in {"hidden_size", "num_hidden_layers", "num_attention_heads"}):  # type: ignore
                 warnings.warn(
                     f"`config.json` doesn't contain all the keys `hidden_size`, `num_hidden_layers`, and `num_attention_heads`, but only {config.keys()}."  # type: ignore
                 )
 
-            cache_size = (
-                2
-                * config.get("num_hidden_layers")  # type: ignore
-                * config.get("num_key_value_heads", config.get("num_attention_heads"))  # type: ignore
-                * (config.get("hidden_size") // config.get("num_attention_heads"))  # type: ignore
-                * max_model_len
-                * dtype_bytes
-            )
+            try:
+                cache_size = (
+                    2
+                    * config.get("num_hidden_layers")  # type: ignore
+                    * config.get("num_key_value_heads", config.get("num_attention_heads"))  # type: ignore
+                    * (config.get("hidden_size") // config.get("num_attention_heads"))  # type: ignore
+                    * max_model_len
+                    * dtype_bytes
+                )
+            except Exception as e:
+                print(f"Error calculating cache size: {e}")
+                cache_size = 0
 
             if batch_size:
                 cache_size *= batch_size
@@ -302,6 +295,8 @@ async def run_with_connector(
         if "model_index.json" in file_paths:
             model_index = await connector.read_file_json("model_index.json")
             out["architecture"] = model_index.get("_class_name")
+
+        print(out)
         return out
     if experimental and cache_size:
         print_report(
