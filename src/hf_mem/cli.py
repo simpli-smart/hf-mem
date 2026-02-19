@@ -263,7 +263,7 @@ async def run_with_connector(
                     2
                     * config.get("num_hidden_layers")  # type: ignore
                     * config.get("num_key_value_heads", config.get("num_attention_heads"))  # type: ignore
-                    * (config.get("hidden_size") // config.get("num_attention_heads"))  # type: ignore
+                    * (config.get("head_dim", config.get("hidden_size") // config.get("num_attention_heads"))) # type: ignore
                     * max_model_len
                     * dtype_bytes
                 )
