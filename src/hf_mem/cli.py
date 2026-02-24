@@ -93,7 +93,7 @@ def get_tp_constraints(
     if q_heads is None:
         return {"error": "Could not find attention head configuration. Ensure config is valid."}
 
-    max_tp = kv_heads
+    max_tp = q_heads
     valid_degrees = [
         i for i in range(1, max_tp + 1) if q_heads % i == 0
     ]
