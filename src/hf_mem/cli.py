@@ -95,7 +95,8 @@ def get_tp_constraints(
 
     max_tp = q_heads
     valid_degrees = [
-        i for i in range(1, max_tp + 1) if q_heads % i == 0
+        i for i in range(1, max_tp + 1)
+        if q_heads % i == 0 and ((i & (i - 1)) == 0)
     ]
 
     return {
