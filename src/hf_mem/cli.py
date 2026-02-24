@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 import struct
 import warnings
@@ -13,7 +14,99 @@ from hf_mem.connectors import AzureConnector, Connector, GCSConnector, HFConnect
 from hf_mem.connectors.hf import make_hf_headers
 from hf_mem.metadata import parse_safetensors_header_bytes, parse_safetensors_metadata
 from hf_mem.print import print_report
-from hf_mem.types import TorchDtypes, get_safetensors_dtype_bytes, torch_dtype_to_safetensors_dtype
+
+
+def resolve_quantization_config(
+    quantization_config: Optional[dict] = None,
+) -> Optional[str]:
+    """Resolve quantization config dict to a short dtype string (e.g. int4, fp8). No transformers dependency."""
+    if quantization_config is None:
+        return "float16"
+
+    if "quant_method" in quantization_config:
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "compressed-tensors":
+            weights = (
+                quantization_config.get("config_groups", {})
+                .get("group_0", {})
+                .get("weights", None)
+            )
+            if weights is not None:
+                return weights.get("type", "int") + str(weights.get("num_bits", 4))
+            return "float16"
+
+        if quant_method == "awq":
+            bits = quantization_config.get("bits", 4)
+            return "int" + str(bits)
+        if quant_method == "gptq":
+            bits = quantization_config.get("bits", 4)
+            return "int" + str(bits)
+
+        if quant_method == "fp8":
+            return "fp8"
+
+        if quant_method == "bitsandbytes":
+            if quantization_config.get("load_in_8bit", False):
+                return "int8"
+            if quantization_config.get("load_in_4bit", False):
+                return "int4"
+            raise ValueError(
+                f"No weights found in BitsAndBytes quantization config: {quantization_config}"
+            )
+        if quant_method == "mxfp4":
+            return "mxfp4"
+
+    if "quantization" in quantization_config:
+        print("Model is quantized with TensorRT Model Optimizer")
+        quant_algo = quantization_config["quantization"]["quant_algo"]
+        if quant_algo == "FP8":
+            return "fp8"
+        if quant_algo == "NVFP4":
+            return "nvfp4"
+        raise ValueError(f"Invalid quantization algorithm: {quant_algo}")
+    return None
+
+def get_tp_constraints(
+    config_input: str | Dict[str, Any], model_id: str = "Unknown"
+) -> Dict[str, Any]:
+    """
+    Compute TP limits from a model config (path or dict).
+    Uses num_attention_heads / num_key_value_heads only.
+    For encoder-decoder (ForConditionalGeneration), uses text_config.
+    """
+    if isinstance(config_input, str):
+        with open(config_input) as f:
+            config = json.load(f)
+    else:
+        config = config_input
+
+    if "text_config" in config:
+        effective = config["text_config"]
+    elif "llm_config" in config:
+        effective = config["llm_config"]
+    else:
+        effective = config
+
+    q_heads = effective.get("num_attention_heads")
+    kv_heads = effective.get("num_key_value_heads", q_heads)
+
+    if q_heads is None:
+        return {"error": "Could not find attention head configuration. Ensure config is valid."}
+
+    max_tp = q_heads
+    valid_degrees = [
+        i for i in range(1, max_tp + 1) if q_heads % i == 0
+    ]
+
+    return {
+        "model": config.get("_name_or_path", model_id),
+        "query_heads": q_heads,
+        "kv_heads": kv_heads,
+        "max_tp": max_tp,
+        "valid_degrees": valid_degrees,
+        "recommended_for_single_node": [d for d in valid_degrees if d <= 8],
+    }
+
 
 # NOTE: Defines the bytes that will be fetched per safetensors file, but the metadata
 # can indeed be larger than that
@@ -59,11 +152,14 @@ async def run_with_connector(
     experimental: bool = False,
     max_model_len: int | None = None,
     batch_size: int = 1,
-    kv_cache_dtype: str | None = None,
+    dtype_bytes: int = 2,
     json_output: bool = False,
     ignore_table_width: bool = False,
+    tp_limits: bool = False,
 ) -> Dict[str, Any] | None:
-    """Unified run: list files and read safetensors/config via the given connector."""
+    """Unified run: list files and read safetensors/config via the given connector.
+    If tp_limits=True, TP constraints are included in the returned dict (with or without json_output).
+    """
     file_paths = await connector.list_files()
 
     if "model.safetensors" in file_paths:
@@ -128,27 +224,21 @@ async def run_with_connector(
 
     cache_size = None
     cache_dtype = None
+    quantization = None
     if experimental and "config.json" in file_paths:
         config: Dict[str, Any] = await connector.read_file_json("config.json")
-        if "architectures" not in config or (
-            "architectures" in config
-            and not any(
-                arch.__contains__("ForCausalLM") or arch.__contains__("ForConditionalGeneration")
-                for arch in config["architectures"]
-            )
-        ):
+        quantization = resolve_quantization_config(config.get("quantization_config"))
+        
+        if "architectures" not in config:
             warnings.warn(
-                "`--experimental` was provided, but either `config.json` doesn't have the `architectures` key meaning that the model architecture cannot be inferred, or rather that it's neither `...ForCausalLM` not `...ForConditionalGeneration`, meaning that the KV Cache estimation might not apply. If that's the case, then remove the `--experimental` flag from the command to suppress this warning."
+                "`--experimental` was provided, but `config.json` doesn't have the `architectures` key meaning that the model architecture cannot be inferred. If that's the case, then remove the `--experimental` flag from the command to suppress this warning."
             )
         else:
-            if (
-                any(arch.__contains__("ForConditionalGeneration") for arch in config["architectures"])
-                and "text_config" in config
-            ):
-                warnings.warn(
-                    f"Given that `--model-id={model_id}` is a `...ForConditionalGeneration` model, then the configuration from `config.json` will be retrieved from the key `text_config` instead."
-                )
+            if  "text_config" in config:
                 config = config["text_config"]
+            
+            elif "llm_config" in config:
+                config = config["llm_config"]
 
             if max_model_len is None:
                 max_model_len = config.get(
@@ -160,87 +250,53 @@ async def run_with_connector(
                 warnings.warn(
                     f"Either the `--max-model-len` was not set, is not available in `config.json` with the any of the keys: `max_position_embeddings`, `n_positions`, or `max_seq_len` (in that order of priority), or both; so the memory required to fit the context length cannot be estimated."
                 )
+                max_model_len = 131072
+                print(f"Using default max model length of 131072")
 
             if not all(k in config for k in {"hidden_size", "num_hidden_layers", "num_attention_heads"}):  # type: ignore
                 warnings.warn(
                     f"`config.json` doesn't contain all the keys `hidden_size`, `num_hidden_layers`, and `num_attention_heads`, but only {config.keys()}."  # type: ignore
                 )
 
-            if kv_cache_dtype in {"fp8_e5m2", "fp8_e4m3"}:
-                cache_dtype = kv_cache_dtype.upper().replace("FP8", "F8")
-            elif kv_cache_dtype in {"fp8", "fp8_ds_mla", "fp8_inc"}:
-                warnings.warn(
-                    f"--kv-cache-dtype={kv_cache_dtype}` has been provided, but given that none of those matches an actual Safetensors dtype since it should be any of `F8_E5M2` or `F8_E4M3`, the `--kv-cache-dtype` will default to `F8_E4M3` instead, which implies that the calculations are the same given that both dtypes take 1 byte despite the quantization scheme of it, or the hardware compatibility; so the estimations should be accurate enough."
+            try:
+                cache_size = (
+                    2
+                    * config.get("num_hidden_layers")  # type: ignore
+                    * config.get("num_key_value_heads", config.get("num_attention_heads"))  # type: ignore
+                    * (config.get("head_dim", config.get("hidden_size") // config.get("num_attention_heads"))) # type: ignore
+                    * max_model_len
+                    * dtype_bytes
                 )
-                cache_dtype = "F8_E4M3"
-            elif kv_cache_dtype == "bfloat16":
-                cache_dtype = "BF16"
-            elif "quantization_config" in config and "quant_method" in config["quantization_config"]:
-                _quantization_config = config["quantization_config"]
-                _quant_method = _quantization_config["quant_method"]
-
-                if _quant_method != "fp8":
-                    raise RuntimeError(
-                        f"Provided `--kv-cache-dtype=auto` (or unset) and given that `config.json` contains the following `quantization_config={_quantization_config}` with a `quant_method` different than `fp8` i.e., `{_quant_method}`, which is not supported; you should enforce the `--kv-cache-dtype` value to whatever quantization precision it's using, if applicable.\nAs KV cache estimation is still experimental, as that might not be the case for your model, then feel free to open an issue at https://github.com/alvarobartt/hf-mem with a report and eventually what solution you would like to see implemented."
-                    )
-
-                _fmt = _quantization_config.get("fmt", _quantization_config.get("format", None))
-                if _fmt:
-                    if not _fmt.startswith("float8_"):
-                        _fmt = f"float8_{_fmt}"
-
-                    if _fmt not in TorchDtypes.__args__:
-                        raise RuntimeError(
-                            f"Provided `--kv-cache-dtype=auto` (or unset) and given that `config.json` contains the following `quantization_config={_quantization_config}` with a `fmt` (or `format`) value of `{_fmt}` that's not supported (should be any of {TorchDtypes.__args__}), you might need to set `--kv-cache-dtype=fp8` to enforce the dtype instead of pulling it from the `config.json`.\nAs KV cache estimation is still experimental, as that might not be the case for your model, then feel free to open an issue at https://github.com/alvarobartt/hf-mem with a report and eventually what solution you would like to see implemented."
-                        )
-
-                    cache_dtype = torch_dtype_to_safetensors_dtype(_fmt)
-                else:
-                    cache_dtype = max(
-                        (
-                            l := [
-                                d
-                                for c in metadata.components.values()
-                                for d in c.dtypes.keys()
-                                if d in {"F8_E5M2", "F8_E4M3"}
-                            ]
-                        ),
-                        key=l.count,
-                        default=None,
-                    )
-
-                    if not cache_dtype:
-                        raise RuntimeError(
-                            f"The `config.json` file for `--model-id={model_id}` contains `quantization_config={_quantization_config}` but the `quant_method=fp8` whereas any tensor in the model weights is set to any of `F8_E4M3` nor `F8_E5M2`, which means that the `F8_` format for the Safetensors dtype cannot be inferred; so you might need to set `--kv-cache-dtype=fp8` to enforce the dtype instead of pulling it from the `config.json`.\nAs KV cache estimation is still experimental, as that might not be the case for your model, then feel free to open an issue at https://github.com/alvarobartt/hf-mem with a report and eventually what solution you would like to see implemented."
-                        )
-            elif _cache_dtype := config.get("torch_dtype", None):
-                cache_dtype = torch_dtype_to_safetensors_dtype(_cache_dtype)
-            elif _cache_dtype := config.get("dtype", None):
-                cache_dtype = torch_dtype_to_safetensors_dtype(_cache_dtype)
-            else:
-                raise RuntimeError(
-                    f"Provided `--kv-cache-dtype={kv_cache_dtype}` but it needs to be any of `auto`, `bfloat16`, `fp8`, `fp8_ds_mla`, `fp8_e4m3`, `fp8_e5m2` or `fp8_inc`. If `--kv-cache-dtype=auto` (or unset), then the `config.json` should either contain the `torch_dtype` or `dtype` fields set; or if quantized, then `quantization_config` needs to be set and contain the key `quant_method` with value `fp8` (as none of `fp32`, `fp16` or `bf16` is considered within the `quantization_config`), and optionally also contain `fmt` set to any valid FP8 format as `float8_e4m3` or `float8_e4m3fn`."
-                )
-
-            cache_size = (
-                2
-                * config.get("num_hidden_layers")  # type: ignore
-                * config.get("num_key_value_heads", config.get("num_attention_heads"))  # type: ignore
-                * (config.get("hidden_size") // config.get("num_attention_heads"))  # type: ignore
-                * max_model_len
-                * get_safetensors_dtype_bytes(cache_dtype)
-            )
+            except Exception as e:
+                print(f"Error calculating cache size: {e}")
+                cache_size = 0
 
             if batch_size:
                 cache_size *= batch_size
 
+    if "hf_quant_config.json" in file_paths:
+        hf_quant_config = await connector.read_file_json("hf_quant_config.json")
+        quantization = resolve_quantization_config(hf_quant_config)
+
     if json_output:
         out = {"model_id": model_id, "revision": revision, **asdict(metadata)}
+        if quantization:
+            out["quantization"] = quantization
         if experimental and cache_size:
             out["max_model_len"] = max_model_len
             out["batch_size"] = batch_size
             out["cache_size"] = cache_size
-            out["cache_dtype"] = cache_dtype  # type: ignore
+        
+        if "config.json" in file_paths and tp_limits:
+            config = await connector.read_file_json("config.json")
+            out["tp_constraints"] = get_tp_constraints(config, model_id)
+            out["architecture"] = config.get("architectures")[0]
+        
+        if "model_index.json" in file_paths:
+            model_index = await connector.read_file_json("model_index.json")
+            out["architecture"] = model_index.get("_class_name")
+
+        print(out)
         return out
     if experimental and cache_size:
         print_report(
@@ -271,9 +327,10 @@ async def run(
     experimental: bool = False,
     max_model_len: int | None = None,
     batch_size: int = 1,
-    kv_cache_dtype: str | None = None,
+    dtype_bytes: int = 2,
     json_output: bool = False,
     ignore_table_width: bool = False,
+    tp_limits: bool = False,
 ) -> Dict[str, Any] | None:
     """Run against Hugging Face Hub using HFConnector."""
     client = httpx.AsyncClient(
@@ -295,9 +352,10 @@ async def run(
             experimental=experimental,
             max_model_len=max_model_len,
             batch_size=batch_size,
-            kv_cache_dtype=kv_cache_dtype,
+            dtype_bytes=dtype_bytes,
             json_output=json_output,
             ignore_table_width=ignore_table_width,
+            tp_limits=tp_limits,
         )
     finally:
         await connector.close()
@@ -381,15 +439,13 @@ def main() -> None:
         default=1,
         help="Batch size to help estimate the required RAM for caching when running the inference. Defaults to 1.",
     )
-    parser.add_argument(
-        "--kv-cache-dtype",
-        type=str,
-        default="auto",
-        # NOTE: https://docs.vllm.ai/en/stable/cli/serve/#-kv-cache-dtype
-        choices={"auto", "bfloat16", "fp8", "fp8_ds_mla", "fp8_e4m3", "fp8_e5m2", "fp8_inc"},
-        help="Data type for the KV cache storage. If `auto` is specified, it will use the default model dtype specified in the `config.json` (if available). Despite the FP8 data types having different formats, all those take 1 byte, meaning that the calculation would lead to the same results. Defaults to `auto`.",
-    )
 
+    parser.add_argument(
+        "--dtype-bytes",
+        type=int,
+        default=2,
+        help="Bytes per dtype. Defaults to 2.",
+    )
     parser.add_argument(
         "--json-output",
         action="store_true",
@@ -399,6 +455,11 @@ def main() -> None:
         "--ignore-table-width",
         action="store_true",
         help="Whether to ignore the maximum recommended table width, in case the `--model-id` and/or `--revision` cause a row overflow when printing those.",
+    )
+    parser.add_argument(
+        "--tp-limits",
+        action="store_true",
+        help="Print tensor parallel limits (max TP and valid degrees) from the model config and exit. Uses the same connector as the main command (--model-id, --local-path, etc.).",
     )
 
     args = parser.parse_args()
@@ -423,25 +484,40 @@ def main() -> None:
         )
 
     async def _run() -> Dict[str, Any] | None:
-        connector: Connector
-        model_id: str
+        connector: Connector | None = None
+        model_id: str = ""
         revision: str = args.revision
 
         if connector_name == "hf":
             if not args.model_id:
                 parser.error("--model-id is required for connector 'hf'")
             model_id = args.model_id
-            return await run(
-                model_id=model_id,
-                revision=revision,
-                experimental=args.experimental,
-                max_model_len=args.max_model_len,
-                batch_size=args.batch_size,
-                kv_cache_dtype=args.kv_cache_dtype,
-                json_output=args.json_output,
-                ignore_table_width=args.ignore_table_width,
-            )
-        if connector_name == "local":
+            if args.tp_limits:
+                client = httpx.AsyncClient(
+                    limits=httpx.Limits(
+                        max_keepalive_connections=MAX_CONCURRENCY,
+                        max_connections=MAX_CONCURRENCY,
+                    ),
+                    timeout=httpx.Timeout(REQUEST_TIMEOUT),
+                    http2=True,
+                    follow_redirects=True,
+                )
+                connector = HFConnector(
+                    model_id, revision, client=client, headers=make_hf_headers(model_id, revision)
+                )
+            else:
+                return await run(
+                    model_id=model_id,
+                    revision=revision,
+                    experimental=args.experimental,
+                    max_model_len=args.max_model_len,
+                    batch_size=args.batch_size,
+                    dtype_bytes=args.dtype_bytes,
+                    json_output=args.json_output,
+                    ignore_table_width=args.ignore_table_width,
+                    tp_limits=args.tp_limits or args.json_output,
+                )
+        elif connector_name == "local":
             if not args.local_path:
                 parser.error("--local-path is required for connector 'local'")
             path = os.path.abspath(os.path.expanduser(args.local_path))
@@ -467,6 +543,18 @@ def main() -> None:
                 account=args.azure_account or None,
             )
 
+        if args.tp_limits and connector is not None and not args.json_output:
+            config = await connector.read_file_json("config.json")
+            result = get_tp_constraints(config, model_id)
+            if "error" in result:
+                print(result["error"])
+                if hasattr(connector, "close"):
+                    await connector.close()
+                return None
+            if hasattr(connector, "close"):
+                await connector.close()
+            return None
+
         return await run_with_connector(
             connector,
             model_id=model_id,
@@ -474,9 +562,11 @@ def main() -> None:
             experimental=args.experimental,
             max_model_len=args.max_model_len,
             batch_size=args.batch_size,
-            kv_cache_dtype=args.kv_cache_dtype,
             json_output=args.json_output,
             ignore_table_width=args.ignore_table_width,
+            tp_limits=args.tp_limits or args.json_output,
         )
 
-    asyncio.run(_run())
+    output = asyncio.run(_run())
+    if output is not None:
+        print(json.dumps(output, indent=2))
