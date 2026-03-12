@@ -80,6 +80,19 @@ class AzureConnector:
 
         return await asyncio.to_thread(_read)
 
+    async def get_file_size(self, path: str) -> int | None:
+        name = self._blob_name(path)
+
+        def _size() -> int | None:
+            blob_client = self._container.get_blob_client(name)
+            try:
+                props = blob_client.get_blob_properties()
+                return props.size if props.size is not None else None
+            except ResourceNotFoundError:
+                return None
+
+        return await asyncio.to_thread(_size)
+
     async def read_file_json(self, path: str) -> Any:
         data = await self.read_file(path)
         return json.loads(data.decode("utf-8"))

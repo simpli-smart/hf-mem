@@ -1,9 +1,15 @@
 import argparse
 import asyncio
+import io
 import json
+import logging
 import os
+import pickle
 import struct
 import warnings
+import zipfile
+
+logger = logging.getLogger(__name__)
 from dataclasses import asdict
 from functools import reduce
 from typing import Any, Dict, List, Optional
@@ -14,6 +20,8 @@ from hf_mem.connectors import AzureConnector, Connector, GCSConnector, HFConnect
 from hf_mem.connectors.hf import make_hf_headers
 from hf_mem.metadata import parse_safetensors_header_bytes, parse_safetensors_metadata
 from hf_mem.print import print_report
+from hf_mem.pytorch_bin import load_pytorch_bin_metadata, load_pytorch_bin_metadata_streaming
+from hf_mem.types import torch_dtype_to_safetensors_dtype
 
 
 def resolve_quantization_config(
@@ -107,6 +115,74 @@ def get_tp_constraints(
         "valid_degrees": valid_degrees,
         "recommended_for_single_node": [d for d in valid_degrees if d <= 8],
     }
+
+
+def _load_pytorch_state_dict_with_torch(data: bytes) -> Dict[str, Any]:
+    """Load PyTorch state dict from bytes with meta device (no tensor data). Requires torch."""
+    import torch
+    return torch.load(io.BytesIO(data), map_location="meta", weights_only=True)
+
+
+def _load_pytorch_state_dict_from_bytes(data: bytes) -> Dict[str, Any]:
+    """Load state dict metadata (no tensor data). Prefers no-torch path; falls back to torch if needed."""
+    try:
+        state_dict = load_pytorch_bin_metadata(data)
+        logger.info("pytorch_model.bin: using no-torch path (ZIP + stub unpickler)")
+        return state_dict
+    except (ValueError, zipfile.BadZipFile, pickle.UnpicklingError, KeyError, AttributeError):
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "pytorch_model.bin could not be read without PyTorch (e.g. legacy format). "
+                "Install with: pip install hf-mem[pytorch]"
+            ) from None
+        logger.info("pytorch_model.bin: using torch path (map_location='meta', weights_only=True)")
+        return _load_pytorch_state_dict_with_torch(data)
+
+
+async def _load_pytorch_state_dict_streaming_or_full(connector: Connector, path: str) -> Dict[str, Any]:
+    """Try streaming (range reads) first to avoid loading full file; fall back to full read if needed."""
+    try:
+        size = await connector.get_file_size(path)
+        if size is not None and size > 0:
+            async def read_range(offset: int, limit: int) -> bytes:
+                return await connector.read_file(path, offset, limit)
+
+            async def get_size() -> int | None:
+                return await connector.get_file_size(path)
+
+            state_dict = await load_pytorch_bin_metadata_streaming(read_range, get_size)
+            if state_dict is not None:
+                logger.info("pytorch_model.bin: using no-torch path (streaming, no full file in memory)")
+                return state_dict
+    except Exception:
+        pass
+    data = await connector.read_file(path)
+    return await asyncio.to_thread(_load_pytorch_state_dict_from_bytes, data)
+
+
+async def _load_pytorch_sharded_streaming_or_full(
+    connector: Connector, shard_paths: List[str]
+) -> Dict[str, Any]:
+    """Load each shard (streaming when possible) and merge state dicts."""
+    state_dict: Dict[str, Any] = {}
+    for shard_path in shard_paths:
+        shard_state = await _load_pytorch_state_dict_streaming_or_full(connector, shard_path)
+        state_dict.update(shard_state)
+    return state_dict
+
+
+def _state_dict_to_raw_metadata(state_dict: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Convert PyTorch state dict to raw_metadata format for parse_safetensors_metadata."""
+    out: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            out[key] = {
+                "dtype": torch_dtype_to_safetensors_dtype(value.dtype),
+                "shape": list(value.shape),
+            }
+    return {"Transformer": out}
 
 
 # NOTE: Defines the bytes that will be fetched per safetensors file, but the metadata
@@ -218,9 +294,20 @@ async def run_with_connector(
             for path, meta_list in path_metadatas.items()
         }
         metadata = parse_safetensors_metadata(raw_metadata=raw_metadata)
+    elif "pytorch_model.bin" in file_paths:
+        state_dict = await _load_pytorch_state_dict_streaming_or_full(connector, "pytorch_model.bin")
+        raw_metadata = _state_dict_to_raw_metadata(state_dict)
+        metadata = parse_safetensors_metadata(raw_metadata=raw_metadata)
+    elif "pytorch_model.bin.index.json" in file_paths:
+        files_index = await connector.read_file_json("pytorch_model.bin.index.json")
+        shard_paths = list(set(files_index["weight_map"].values()))
+        state_dict = await _load_pytorch_sharded_streaming_or_full(connector, shard_paths)
+        raw_metadata = _state_dict_to_raw_metadata(state_dict)
+        metadata = parse_safetensors_metadata(raw_metadata=raw_metadata)
     else:
         raise RuntimeError(
-            "NONE OF `model.safetensors`, `model.safetensors.index.json`, `model_index.json` HAS BEEN FOUND"
+            "NONE OF `model.safetensors`, `model.safetensors.index.json`, `model_index.json`, "
+            "`pytorch_model.bin`, `pytorch_model.bin.index.json` HAS BEEN FOUND"
         )
 
     cache_size = None
@@ -364,7 +451,7 @@ async def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Estimate inference memory for models (safetensors). Supports HF Hub, local folder, S3, and GCS.",
+        description="Estimate inference memory for models (safetensors, pytorch_model.bin). Supports HF Hub, local folder, S3, and GCS.",
     )
 
     parser.add_argument(
@@ -462,8 +549,17 @@ def main() -> None:
         action="store_true",
         help="Print tensor parallel limits (max TP and valid degrees) from the model config and exit. Uses the same connector as the main command (--model-id, --local-path, etc.).",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable logging (e.g. which pytorch_model.bin loading method is used).",
+    )
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     # Resolve connector
     connector_name = args.connector

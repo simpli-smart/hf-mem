@@ -51,6 +51,16 @@ class GCSConnector:
 
         return await asyncio.to_thread(_read)
 
+    async def get_file_size(self, path: str) -> int | None:
+        key = f"{self._prefix}{path}" if self._prefix else path
+        blob = self._bucket.blob(key)
+
+        def _size() -> int | None:
+            blob.reload()
+            return blob.size if blob.size is not None else None
+
+        return await asyncio.to_thread(_size)
+
     async def read_file_json(self, path: str) -> Any:
         data = await self.read_file(path)
         return json.loads(data.decode("utf-8"))

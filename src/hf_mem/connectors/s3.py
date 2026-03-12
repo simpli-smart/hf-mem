@@ -62,6 +62,20 @@ class S3Connector:
 
         return await asyncio.to_thread(_read)
 
+    async def get_file_size(self, path: str) -> int | None:
+        key = self._key(path)
+
+        def _head() -> int | None:
+            try:
+                r = self._client.head_object(Bucket=self._bucket, Key=key)
+                return r.get("ContentLength")
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    return None
+                raise
+
+        return await asyncio.to_thread(_head)
+
     async def read_file_json(self, path: str) -> Any:
         data = await self.read_file(path)
         return json.loads(data.decode("utf-8"))
