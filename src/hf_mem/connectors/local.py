@@ -40,6 +40,12 @@ class LocalConnector:
 
         return await asyncio.to_thread(_read)
 
+    async def get_file_size(self, path: str) -> int | None:
+        full = os.path.join(self._folder, path)
+        if not os.path.isfile(full):
+            return None
+        return await asyncio.to_thread(os.path.getsize, full)
+
     async def read_file_json(self, path: str) -> Any:
         data = await self.read_file(path)
         return json.loads(data.decode("utf-8"))

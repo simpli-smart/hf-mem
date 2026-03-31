@@ -58,6 +58,13 @@ class HFConnector:
         r.raise_for_status()
         return r.content
 
+    async def get_file_size(self, path: str) -> int | None:
+        client = self._get_client()
+        r = await client.head(self._url(path), headers=self._headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        cl = r.headers.get("content-length")
+        return int(cl) if cl is not None else None
+
     async def read_file_json(self, path: str) -> Any:
         client = self._get_client()
         r = await client.get(self._url(path), headers=self._headers, timeout=REQUEST_TIMEOUT)
