@@ -13,6 +13,7 @@ SafetensorsDtypes = Literal[
     "U16",
     "F8_E5M2",  # NOTE: Only CUDA +11.8
     "F8_E4M3",  # NOTE: CUDA +11.8 and AMD ROCm
+    "F8_E8M0",  # NOTE: OCP microscaling (MX) format
     "I8",
     "U8",
 ]
@@ -26,7 +27,7 @@ def get_safetensors_dtype_bytes(dtype: SafetensorsDtypes | str) -> int:
             return 4
         case "F16" | "BF16" | "I16" | "U16":
             return 2
-        case "F8_E5M2" | "F8_E4M3" | "I8" | "U8":
+        case "F8_E5M2" | "F8_E4M3" | "F8_E8M0" | "I8" | "U8":
             return 1
         case _:
             raise RuntimeError(f"DTYPE={dtype} NOT HANDLED")
